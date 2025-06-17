@@ -1,6 +1,5 @@
-__import__('pysqlite3')
+import sqlite3
 import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import os
 from dotenv import load_dotenv
 import streamlit as st
@@ -153,7 +152,7 @@ def get_langchain_components(_api_key_for_cache): # Parameter ensures cache reac
     # """
     prompt_template_str = """
     You are a helpful assistant.
-    Analyze the context and find right doctor based on symptom the user input.
+    Analyze the context and find the right doctor based on the symptoms that the user provided.
 
     If you don't know the answer to a specific question, it's better to say so rather than inventing one.
 
