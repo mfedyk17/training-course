@@ -1,4 +1,6 @@
-# Block 2: Create the Streamlit Application File (app.py)
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import os
 from dotenv import load_dotenv
 import streamlit as st
@@ -8,14 +10,14 @@ from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain.schema.runnable import RunnablePassthrough
 from langchain.schema.output_parser import StrOutputParser
 from langchain.prompts import ChatPromptTemplate
-from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import DataFrameLoader
 from datasets import load_dataset
+from langchain.docstore.document import Document
+from langchain.schema.runnable import RunnableLambda, RunnablePassthrough
+from langchain_community.vectorstores import Chroma
 
-load_dotenv()
-api_key = os.environ['OPENAI_API_KEY']
 
-def create_and_store_embeddings(documents_to_embed: list, document_metadata: list, api_key: str) -> Chroma:
+def create_and_store_embeddings(documents_to_embed: list, api_key: str) -> Chroma:
     """
     Initializes an embedding model and creates a vector store from documents.
 
@@ -49,23 +51,28 @@ def create_and_store_embeddings(documents_to_embed: list, document_metadata: lis
     # --- NOTE: Converting the documents into vectors takes time, for this example, expect about 30 seconds. ---
     vectorstore = Chroma.from_documents(
             documents = documents_to_embed,  # The list of prepared Document objects.
-            collection_metadata = document_metadata,
+            # collection_metadata = document_metadata,
             embedding = embeddings_model,    # The model to use for the embedding process.
-            # persist_directory="./chroma_db"  # Optional: You can uncomment this line to save the
-                                               # database to a folder on your computer. This allows
+            # persist_directory="./chroma_db",   # Optional: You can uncomment this line to save the
+            # client_settings=Settings(chroma_db_impl="duckdb+parquet")                                  # database to a folder on your computer. This allows
                                                # you to load it again later without re-running the process if it is time consuming
         )
 
     # Return the fully populated vector store object, which is now ready to be used for searches.
     return vectorstore
 
-dataset = load_dataset("dgervais/patient-doctor")
-notes = dataset["train"].to_pandas()
 
-loader = DataFrameLoader(notes, page_content_column="text_lemmatized")
-documents = loader.load()
-vector_store = create_and_store_embeddings(documents, api_key)
-# ------
+dataset = load_dataset("dgervais/patient-doctor", split="train")
+notes = dataset.to_pandas()
+documents = [
+    Document(
+        page_content=row["text_lemmatized"],
+        metadata={
+            "doctor_name": row["doctor_name"]
+        }
+    )
+    for _, row in notes.iterrows()
+]
 
 # --- Helper functions for RAG ---
 
@@ -73,83 +80,11 @@ vector_store = create_and_store_embeddings(documents, api_key)
 # The retriever will return a list of Document objects. This function takes that list,
 # extracts the 'page_content' (the actual text) from each, and joins them together
 # with two newline characters in between. This creates a clean, readable context block.
-def format_docs(docs):
-    return "\n\n".join(doc.text_lemmatized for doc in docs)
-
-# This is the main function that orchestrates the entire RAG process.
-def generate_rag_response(input_text: str, _vectorstore, _openai_api_key: str) -> str:
-    """
-    Generates a response using the RAG pattern.
-
-    Args:
-        input_text: The user's question.
-        _vectorstore: The Chroma vector store containing the document embeddings.
-        _openai_api_key: The API key for the OpenAI service.
-
-    Returns:
-        The AI-generated response as a string.
-    """
-    # A quick safety check to ensure the vector store has been created before we try to use it.
-    if _vectorstore is None:
-        return "Error: Vector store not available."
-
-    # Initialize the Language Model (LLM) we'll use to generate the final answer.
-    # 'temperature=0.7' controls the creativity of the model; higher values mean more creative,
-    # lower values mean more deterministic and factual.
-    llm = ChatOpenAI(temperature=0.7, api_key=_openai_api_key)
-
-    # Create a "retriever" from our vector store. A retriever is an object that can
-    # "retrieve" documents from a database based on a query.
-    # 'search_kwargs={"k": 3}' tells the retriever to find the top 3 most relevant
-    # document chunks for any given question.
-    retriever = _vectorstore.as_retriever(search_kwargs={"k": 3})
-
-    # Define the prompt template. This is the heart of our instruction to the AI.
-    # It sets the persona (a literary assistant), gives clear instructions on how to behave,
-    # and defines where the retrieved 'context' and user's 'question' will be inserted.
-    prompt_template = """You are a helpful assistant.
-    Analyze the context below to answer the user's question.
-
-    # # # TODO: # # # - MODIFY THIS PROMPT TO IMRPOVE YOUR RESPONSE! # # #
-
-    Context:
-    {context}
-
-    Question: {question}
-
-    Answer:"""
-
-    # Create a ChatPromptTemplate object from the string template defined above.
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-
-    # Now, we create the full RAG chain using LangChain Expression Language (LCEL).
-    # The '|' (pipe) operator connects the different components in a sequence.
-    rag_chain = (
-        # This first step runs in parallel. It creates a dictionary containing the 'context' and 'question'.
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        # 1a. "context": The user's input goes to the 'retriever', which finds relevant docs.
-        #     The list of docs is then passed to our 'format_docs' function to create the context string.
-        # 1b. "question": 'RunnablePassthrough' simply takes the user's original input (the question)
-        #     and passes it through unchanged.
-
-        | prompt          # 2. The dictionary from the previous step is "piped" into the 'prompt' template.
-                          #    This fills in the {context} and {question} placeholders.
-
-        | llm             # 3. The fully-formatted prompt is sent to the language model ('llm') to generate an answer.
-
-        | StrOutputParser() # 4. The model's output (a chat message object) is converted into a simple string.
+def format_docs(docs: list[Document]) -> str:
+    return "\n\n".join(
+        f"[{i+1}] Doctor: {d.metadata.get('doctor_name', 'Unknown')}\n{d.page_content}"
+        for i, d in enumerate(docs)
     )
-
-    # Use a try-except block for robust error handling, especially for API calls.
-    try:
-        # ".invoke()" is the command that runs the entire chain with the user's question.
-        response = rag_chain.invoke(input_text)
-        return response
-    except Exception as e:
-        # If anything goes wrong during the chain execution, print the error.
-        print(f"Error generating response: {e}")
-        return "Sorry, an error occurred while generating the response."
-# ------
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -193,21 +128,43 @@ if not openai_api_key:
     st.warning("Please provide your OpenAI API Key in the sidebar to use the chat.")
     st.stop() # Stop execution if no API key is available
 
+@st.cache_resource
+def load_vectorstore(api_key: str):
+    return create_and_store_embeddings(documents, api_key)
+
+vector_store = load_vectorstore(openai_api_key)
+get_query = RunnableLambda(lambda d: d["user_input"])
+
 # --- LangChain Setup (Cached for efficiency) ---
 @st.cache_resource # Caches the LLM and prompt template
 def get_langchain_components(_api_key_for_cache): # Parameter ensures cache reacts to API key changes if necessary
     """Initializes and returns the LangChain LLM and prompt template."""
-    llm = ChatOpenAI(openai_api_key=_api_key_for_cache, model_name="gpt-4o-mini")
+    llm = ChatOpenAI(temperature=0.7, api_key=_api_key_for_cache, model_name="gpt-4o-mini")
+    # llm = ChatOpenAI(openai_api_key=_api_key_for_cache, model_name="gpt-4o-mini")
     
+    # prompt_template_str = """
+    # You are a knowledgeable and friendly AI assistant.
+    # Your goal is to provide clear, concise, and helpful answers to the user's questions.
+    # If you don't know the answer to a specific question, it's better to say so rather than inventing one.
+
+    # User Question: {user_input}
+
+    # AI Response:
+    # """
     prompt_template_str = """
-    You are a knowledgeable and friendly AI assistant.
-    Your goal is to provide clear, concise, and helpful answers to the user's questions.
+    You are a helpful assistant.
+    Analyze the context and find right doctor based on symptom the user input.
+
     If you don't know the answer to a specific question, it's better to say so rather than inventing one.
 
-    User Question: {user_input}
+    Context:
+    {context}
 
-    AI Response:
-    """
+    Question: {question}
+
+    AI Response:"""
+
+    
     prompt = ChatPromptTemplate.from_template(prompt_template_str)
     return llm, prompt
 
@@ -238,9 +195,15 @@ if user_query := st.chat_input("What would you like to ask?"):
         message_placeholder = st.empty() # For "Thinking..." message and then the actual response
         with st.spinner("AI is thinking..."):
             try:
-                chain = prompt_template | llm
-                ai_response_message = chain.invoke({"user_input": user_query})
-                ai_response_content = ai_response_message.content
+                retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+                rag_chain = (
+        {"context": get_query | retriever | format_docs, "question": get_query | RunnablePassthrough()}
+        | prompt_template  
+        | llm           
+        | StrOutputParser() 
+    )
+                ai_response_message = rag_chain.invoke({"user_input": user_query})
+                ai_response_content = ai_response_message
                 
                 message_placeholder.markdown(ai_response_content)
                 # Add AI response to session state
@@ -262,15 +225,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("About")
     st.info(
-        "This is a Streamlit application demonstrating an AI chat interface "
+        "This is a Streamlit application about doctor recommendation system based on symptom decription "
         "using LangChain and OpenAI's gpt-4o-mini model."
     )
-
-
-# --- Block 3: Run the Streamlit Application ---
-
-# To start your streamlit app, run the following command in your terminal:
-
-# streamlit run hf_streamlit_ai_app.py
-# Make sure you have the required packages installed:
-# pip install streamlit langchain openai langchain_openai -q
